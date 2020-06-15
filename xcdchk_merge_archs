@@ -1,0 +1,716 @@
+#!/bin/bash
+#
+# Merges the data of all Archs and run some sanity checks between
+# archs.
+#
+
+#
+# Some variables
+#
+PRODUCT="SLES-11-SP1"
+DATABASE="/data/xcdchk"
+ARCHS="i386 x86_64 ppc64 ia64 s390x"
+CHECK_ABI=true
+
+# Dependencies (rpmdevtools)
+KUKUKDIR="$(dirname "$(readlink -f "$0")")"
+INCDIR=$KUKUKDIR/xcdchk.inc
+if [ -f /data/sle/bin/rpmvercmp ]; then
+  RPMVERCMP_CMD=/data/sle/bin/rpmvercmp
+else
+  RPMVERCMP_CMD=/usr/bin/rpmdev-vercmp
+fi
+
+BUILD=""
+OLDBUILD=""
+VERBOSE=true
+MERGE=false
+ONLY_CREATE_CHANGELOG=false
+ONLY_CREATE_PKGLIST=false
+LAST_CHANGELOG=""
+
+# Directories
+# set later after option evaluation
+DATA_RPM=""
+DATA_SRPM=""
+
+# Files
+DATA_DUPLICATE_RPM=""
+DATA_DIFFVERSION_RPM=""
+DATA_DUPLICATE_SRPM=""
+DATA_DIFFARCH_RPM=""
+
+ARCH="all"
+
+# This is needed to consistently sort the entries.
+export LC_COLLATE=de_DE
+
+# Source some files
+. $INCDIR/Compare_pkglist.inc
+
+Usage()
+{
+    fmt -s << EOF
+
+xcdchk_merge_archs - Generate nice ChangeLog file for all archs
+
+Usage:
+
+  xcdchk_merge_archs -b <BUILD> [<OPTIONS>]
+
+Options:
+
+  -a <ARCHS>            List of architectures [default: $ARCHS]
+  -b <BUILD>            Build number/name of snapshot
+  -c                    Only create ChangeLogs
+  -d <DATABASE>         Base directory for data
+                        [default: $DATABASE]
+  -l                    Only create package list between two builds
+  -m <LAST_CHANGELOG>   Merge with last changelog file
+  -o <OLDBUILD>         Build number/name of old snapshot
+  -p <PRODUCT>          Name of product [default $PRODUCT]
+  -q                    Quiet mode
+
+Output goes to $DATABASE/$PRODUCT/<BUILD>/all
+
+
+Example:
+
+The database needs to be initialised with the first build:
+
+   xcdchk_merge_archs -b <BUILD> [-a <ARCHS>] [-d <DATABASE>] [-p <PRODUCT>]
+
+For the second build xcdchk can now compare the content of the build:
+
+   xcdchk_merge_archs -b <BUILD> -o <OLDBUILD> [-a <ARCHS>] [-d <DATABASE>] \
+       [-p <PRODUCT>] [-m <LAST_CHANGELOG>]
+
+EOF
+        exit 1
+}
+
+
+Error()
+{
+        echo
+        echo "$@" 1>&2
+        echo
+}
+
+
+Abort()
+{
+        Error "$@"
+        echo
+        echo "Aborting ..."
+        echo
+        exit 1
+}
+
+Verbose()
+{
+    if [ "$VERBOSE" = "true" ]; then
+	if [ $# -gt 0 -a "X$1" = "X-n" ]; then
+	    echo -n "$@" 1>&2
+	else
+	    echo "$@" 1>&2
+	fi
+    fi
+}
+
+Generate_Data_Structure()
+{
+
+    Verbose "Generate Data Structure below $DATABASE/$PRODUCT/$BUILD/all"
+
+    #rm -rf $DATABASE/$PRODUCT/$BUILD/all
+    mkdir -p $DATABASE/$PRODUCT/$BUILD/all
+    mkdir -p $DATA_RPM
+    mkdir -p $DATA_SRPM
+
+    for arch in $ARCHS ; do
+     if [ -d $DATABASE/$PRODUCT/$BUILD/$arch/RPM ]; then
+       (cd $DATABASE/$PRODUCT/$BUILD/$arch/RPM; cp -a * $DATA_RPM)
+     else
+       echo "ERROR: $PRODUCT/$BUILD/$arch/RPM does not exist!"
+     fi
+     if [ -d $DATABASE/$PRODUCT/$BUILD/$arch/RPM ]; then
+       (cd $DATABASE/$PRODUCT/$BUILD/$arch/SRPM; cp -a * $DATA_SRPM)
+     else
+       echo "ERROR: $PRODUCT/$BUILD/$arch/SRPM does not exist!"
+     fi
+    done
+}
+
+
+Find_duplicate_binary_RPMS()
+{
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/all/tmp.duplicate.$$"
+
+    rm -rf $WORKDIR
+    mkdir -p $WORKDIR/packages
+    mkdir -p $WORKDIR/duplicates
+
+    for i in $DATA_RPM/* ; do
+        local RPM_NAME=${i##*/}
+	local RPM_ARCH=${RPM_NAME##*.}
+	local PKGNAME=${RPM_NAME%-*-*.*}.$RPM_ARCH
+
+	if [ -f $WORKDIR/packages/$PKGNAME ]; then
+	    echo "$RPM_NAME" >> $WORKDIR/packages/$PKGNAME
+	    touch $WORKDIR/duplicates/$PKGNAME
+	else
+	    echo "$RPM_NAME" > $WORKDIR/packages/$PKGNAME
+	fi
+    done
+
+    for i in `/bin/ls $WORKDIR/duplicates/` ; do
+	local j
+	local first
+	local pkgwithoutarch=${i%.*}
+
+        first=1
+
+	echo -n "$i:" >> $DATA_DUPLICATE_RPM
+	for j in `cat $WORKDIR/packages/$i` ; do
+            if [ $first -eq 1 ] ; then
+		first=0
+	    else
+		echo -n "," >> $DATA_DUPLICATE_RPM
+	    fi
+	    local ver=${j#$pkgwithoutarch-}; ver=${ver%.*}
+	    echo -n " $ver" >> $DATA_DUPLICATE_RPM
+	done
+	echo >> $DATA_DUPLICATE_RPM
+    done
+
+    rm -rf $WORKDIR
+}
+
+#
+# Search for SRPMs which have different version numbers and delete
+# older versions.
+#
+Find_duplicate_SRPMS()
+{
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/all/tmp.duplicate.$$"
+
+    rm -rf $WORKDIR
+    mkdir -p $WORKDIR/packages
+    mkdir -p $WORKDIR/duplicates
+
+    for i in $DATA_SRPM/* ; do
+        local RPM_NAME=${i##*/}
+	local PKGNAME=${RPM_NAME%-*-*}
+
+	if [ -f $WORKDIR/packages/$PKGNAME ]; then
+	    echo "$RPM_NAME" >> $WORKDIR/packages/$PKGNAME
+	    touch $WORKDIR/duplicates/$PKGNAME
+	else
+	    echo "$RPM_NAME" > $WORKDIR/packages/$PKGNAME
+	fi
+    done
+
+    for i in `/bin/ls $WORKDIR/duplicates/` ; do
+	local j
+	local first
+        local lastver
+
+        first=1
+
+	echo -n "$i:" >> $DATA_DUPLICATE_SRPM
+	for j in `cat $WORKDIR/packages/$i` ; do
+	    lastver=$j
+            if [ $first -eq 1 ] ; then
+		first=0
+		rm $DATA_SRPM/$j
+	    else
+		echo -n "," >> $DATA_DUPLICATE_SRPM
+	    fi
+	    local ver=${j#$i-}
+	    echo -n " $ver" >> $DATA_DUPLICATE_SRPM
+	done
+	echo >> $DATA_DUPLICATE_SRPM
+	touch $DATA_SRPM/$lastver
+    done
+
+    rm -rf $WORKDIR
+}
+
+
+#
+# Ueberprueft, das ein Paket fuer verschiedene Archs die gleiche
+# Versionsnummer hat.
+#
+Check_version_consistency_of_RPMS()
+{
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/all/tmp.WrongArchVersion.$$"
+
+    Verbose "   - Different versions on different archs"
+
+    mkdir -p $WORKDIR/packages
+    mkdir -p $WORKDIR/packages-version
+    mkdir -p $WORKDIR/mismatch
+
+    for i in $DATA_RPM/* ; do
+        local RPM_NAME=${i##*/}
+	local RPM_ARCH=${RPM_NAME##*.}
+	local PKGNAME=${RPM_NAME%-*-*.*}
+	local T=${RPM_NAME%.*}
+	local VERSION=${T#$PKGNAME-}
+
+	if [ -f $WORKDIR/packages/$PKGNAME ]; then
+
+            echo "$RPM_NAME" >> $WORKDIR/packages/$PKGNAME
+
+	    if [ ! -f $WORKDIR/packages-version/$PKGNAME-$VERSION ]; then
+		touch $WORKDIR/mismatch/$PKGNAME
+	    fi
+	else
+	    echo "$RPM_NAME" > $WORKDIR/packages/$PKGNAME
+	    touch $WORKDIR/packages-version/$PKGNAME-$VERSION
+	fi
+    done
+
+    for i in `/bin/ls $WORKDIR/mismatch/` ; do
+	local j
+	local first
+	local pkgwithoutarch=${i%.*}
+
+        first=1
+
+	echo -n "$i:" >> $DATA_DIFFVERSION_RPM
+	for j in `cat $WORKDIR/packages/$i` ; do
+            if [ $first -eq 1 ] ; then
+		first=0
+	    else
+		echo -n "," >> $DATA_DIFFVERSION_RPM
+	    fi
+	    local RPM_ARCH=${j##*.}
+	    local ver=${j#$pkgwithoutarch-}; ver=${ver%.*}
+	    echo -n " $ver.$RPM_ARCH" >> $DATA_DIFFVERSION_RPM
+	done
+	echo >> $DATA_DIFFVERSION_RPM
+    done
+
+    rm -rf $WORKDIR
+}
+
+#
+# Creates a list of RPMs, which are not available for all architectures
+#
+List_arch_only_RPMS()
+{
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/all/tmp.ListArchVersion.$$"
+
+    Verbose "   - RPMs not available for all architectures"
+
+    mkdir -p $WORKDIR/packages-version
+
+    for i in $DATA_RPM/* ; do
+        local RPM_NAME=${i##*/}
+	local PKGVERSION=${RPM_NAME%.*}
+
+        touch $WORKDIR/packages-version/$PKGVERSION
+    done
+
+    for i in $WORKDIR/packages-version/* ; do
+      local RPM_NAME=${i##*/}
+      local first=1;
+      local missing=0;
+      local archlist="";
+
+      for arch in $ARCHS ; do
+        RPMLIST=`/bin/ls $DATABASE/$PRODUCT/$BUILD/$arch/RPM/$RPM_NAME.* 2> /dev/null`
+        if [ "x$RPMLIST" == "x" ]; then
+          missing=1;
+        else
+          if [ "$first" == "1" ]; then
+            archlist="$arch";
+            first=0;
+          else
+            archlist="$archlist,$arch";
+          fi
+        fi
+      done
+      if [ "$missing" == "1" ] ; then
+        echo "$RPM_NAME: $archlist" >> $DATA_DIFFARCH_RPM
+      fi
+    done
+
+    rm -rf $WORKDIR
+}
+
+Check_package_consistency()
+{
+    Verbose "Check package consistency"
+
+    Verbose "   - Different versions of same package"
+
+    Find_duplicate_binary_RPMS
+    Find_duplicate_SRPMS
+    Check_version_consistency_of_RPMS
+    List_arch_only_RPMS
+}
+
+
+##
+## Stuff for generating ChangeLog
+##
+
+Format_ChangeLog()
+{
+    if [ ! -f "`dirname $1`/changelog.old" ]; then
+	echo "## WARNING - the following diff is a head -20 proposal"
+	cat $1 | sed -n '/^+/s/^.//p' | \
+	    sed '{
+                                /^++/d
+                                /^$/d
+                                }'
+    else
+	cat $1 | sed -n '/^+/s/^.//p' | \
+	    sed '{
+                                /^++/d
+                                /^*/d
+                                /^$/d
+                                }'
+    fi
+}
+
+
+GenerateChangeLog_by_SRPMchanges_package()
+{
+    local rpmname=${1##*/}
+    local pkgdir=$2/$rpmname
+    local snippetdir=$3
+    local removed=0
+
+    case $rpmname in
+	kernel-source)
+         ;;
+        kernel-*)
+        return
+         ;;
+        yast2-trans-*)
+        return
+         ;;
+	sles-release)
+	return
+	 ;;
+	ConsoleKit-doc|dbus-1-x11|dbus-1-mono|hal-doc|installation-images|PolicyKit-doc|unixODBC-gui-qt|blocxx-doc|libgcj|openldap2-client|samba-doc|libqt4-devel-doc|libqt4-sql-plugins|libQtWebKit-devel|systemtap-docs|postgresql-libs)
+	return
+	 ;;
+    esac
+
+    if [ ! -f $pkgdir/changelog.new ]; then
+	echo -n "o Removed $rpmname (XXX)"
+        removed=1
+    elif [ ! -f $pkgdir/changelog.old ]; then
+	echo -n "o Added $rpmname (feature)"
+	touch $pkgdir/changelog.old
+	diff -u $pkgdir/changelog.old \
+	    $pkgdir/changelog.new \
+	    | head -20 \
+	    > $pkgdir/changelog.diff
+	rm -f $pkgdir/changelog.old
+    else
+	diff -u $pkgdir/changelog.old \
+	    $pkgdir/changelog.new \
+	    > $pkgdir/changelog.diff
+	if [ ! -s $pkgdir/changelog.diff ]; then
+	    continue
+	fi
+	if [ -f $snippetdir/$rpmname ]; then
+          echo -n `head -n 1 $snippetdir/$rpmname | sed -e 's|\[.*\]||'`
+	else
+	  echo -n "o Updated $rpmname (security/bugfix/feature)"
+	fi
+    fi
+
+    local first=1;
+    local missing=0;
+    local archlist="";
+
+    if [ $removed -ne 1 ]; then
+      for arch in $ARCHS ; do
+       local found=0;
+       for i in $DATABASE/$PRODUCT/$BUILD/$arch/SRPM/$rpmname-* ; do
+         if [ $i == "$DATABASE/$PRODUCT/$BUILD/$arch/SRPM/$rpmname-*" ]; then
+           missing=1
+           break
+         fi
+         local SRPM_NAME=${i##*/}
+         local SRPM_NAME=${SRPM_NAME%-*-*}
+         if [ $rpmname == $SRPM_NAME ]; then
+           found=1;
+           if [ "$first" == "1" ]; then
+             archlist="\t[$arch";
+             first=0;
+           else
+             archlist="$archlist,$arch";
+           fi
+         fi
+         if [ "$found" == "0" ]; then
+           missing=1;
+         fi
+       done
+      done
+
+      if [ "$missing" == "1" ]; then
+        echo -e "$archlist]"
+      else
+        echo
+      fi
+    else
+      echo
+   fi
+
+    echo
+    test -f $pkgdir/changelog.diff && Format_ChangeLog $pkgdir/changelog.diff
+}
+
+GenerateChangeLog_by_SRPMchanges()
+{
+    local i
+    OLD_SRPM="$DATABASE/$PRODUCT/$OLDBUILD/all/SRPM"
+    local WORKDIR="$1/packages"
+
+    mkdir -p $WORKDIR
+
+    Verbose -n "   - Building Changelog diffs "
+
+    for i in $DATA_SRPM/* ; do
+        local SRPM_NAME=${i##*/}
+	local PKGNAME=${SRPM_NAME%-*-*}
+
+	mkdir -p $WORKDIR/$PKGNAME
+        cp $i $WORKDIR/$PKGNAME/changelog.new
+    done
+
+    for i in $OLD_SRPM/* ; do
+        local SRPM_NAME=${i##*/}
+	local PKGNAME=${SRPM_NAME%-*-*}
+
+	mkdir -p $WORKDIR/$PKGNAME
+        cp $i $WORKDIR/$PKGNAME/changelog.old
+    done
+
+    for i in $WORKDIR/* ; do
+      Verbose -n "."
+      GenerateChangeLog_by_SRPMchanges_package $i $WORKDIR $1/snippets > $i/snippet
+    done
+
+    Verbose
+}
+
+# Split_ChangeLog - splits changelog file into per package snippets
+#
+# Expects the following format:
+#
+#       o {Updated,Added,Removed} <PACKAGENAME> ...
+#
+#         - ...
+#         - ...
+#
+#       --------------------------------------------------------------------
+#
+Split_ChangeLog()
+{
+        local WORKDIR="$1"
+        local TMP_CHANGELOG="$WORKDIR/ChangeLog.tmp.$$"
+	local PKG_LIST="$WORKDIR/PKG_LIST.$$"
+        local changelog_file=""
+        local dest_dir=""
+        local i
+
+	shift 1
+
+        if [ $# -ne 2 ]; then
+                Abort "Split_ChangeLog: Wrong number of arguments"
+        else
+                changelog_file="$1"
+                dest_dir="$2"
+        fi
+
+        # prepare current copy of changelog for parsing
+        rm -f $TMP_CHANGELOG
+        cp $changelog_file $TMP_CHANGELOG
+
+        # determine list of packages contained in changelog
+        rm -f $PKG_LIST
+        sed -n '/^o [^ ]* [^ ]* /s/^o [^ ]* \([^ ]*\) .*$/\1/p' $TMP_CHANGELOG | sort -u > $PKG_LIST
+
+	rm -fr $dest_dir
+        mkdir -p $dest_dir
+        for i in `cat $PKG_LIST` ; do
+                sed -n "/^o [^ ]* $i /,/^-----/p" $TMP_CHANGELOG \
+                        | sed '/^-----/d' >> $dest_dir/$i
+        done
+
+	rm -f $TMP_CHANGELOG
+	rm -f $PKG_LIST
+}
+
+MergeChangeLogSnippets()
+{
+    local WORKDIR="$1"
+    local PKG_LIST="$WORKDIR/PKG_LIST.$$"
+
+    mkdir -p $WORKDIR/merged-snippets
+
+    for i in $WORKDIR/packages/* ; do
+	local pkgname=${i##*/}
+	test -s $WORKDIR/packages/$pkgname/snippet && sed "s/^/#/g" $WORKDIR/packages/$pkgname/snippet > $WORKDIR/merged-snippets/$pkgname
+    done
+
+    for i in $WORKDIR/snippets/* ; do
+	local pkgname=${i##*/}
+        if [ -f $WORKDIR/merged-snippets/$pkgname ]; then
+	    cat $i |sed "/^o /d" |sed "/^$/d" >> $WORKDIR/merged-snippets/$pkgname
+	else
+	    # empty line is already there on the end,
+	    # remove it.
+	    head -n 2 $i > $WORKDIR/merged-snippets/$pkgname
+	    tail -n +2 $i | sed "/^$/d" >> $WORKDIR/merged-snippets/$pkgname
+	fi
+    done
+}
+
+GenerateChangeLog()
+{
+    WORKDIR="$DATABASE/$PRODUCT/$BUILD/all/ChangeLog-tmp.$$"
+
+    mkdir -p $WORKDIR
+
+    Verbose "Generate ChangeLog"
+
+    if [ "$MERGE" = "true" ]; then
+        # Create split of old changelog and save to snippets
+        Split_ChangeLog $WORKDIR $LAST_CHANGELOG $WORKDIR/snippets
+    fi
+
+    GenerateChangeLog_by_SRPMchanges $WORKDIR
+
+    NEW_CHANGELOG=$DATABASE/$PRODUCT/$BUILD/all/ChangeLog-$OLDBUILD-$BUILD
+
+    rm -f $NEW_CHANGELOG
+    for i in $WORKDIR/packages/*/snippet; do
+	if [ -s $i ]; then
+	    cat $i >> $NEW_CHANGELOG
+	    echo >> $NEW_CHANGELOG
+	    echo "-----------------------------------------------------------------------------" >> $NEW_CHANGELOG
+	    echo >> $NEW_CHANGELOG
+	fi
+    done
+
+    if [ "$MERGE" = "true" ]; then
+	MergeChangeLogSnippets $WORKDIR
+
+	NEW_CHANGELOG=$DATABASE/$PRODUCT/$BUILD/all/ChangeLog.raw
+
+	rm -f $NEW_CHANGELOG
+	for i in $WORKDIR/merged-snippets/*; do
+	    cat $i >> $NEW_CHANGELOG
+	    echo >> $NEW_CHANGELOG
+	    echo "-----------------------------------------------------------------------------" >> $NEW_CHANGELOG
+	    echo >> $NEW_CHANGELOG
+	done
+    fi
+
+    rm -rf $WORKDIR
+}
+
+#
+# Main
+#
+
+#
+# Argument parsing
+#
+
+while [ 1 ]; do
+    if [ $# -eq 0 ]; then
+	    break
+    fi
+
+    if [ $# -ge 2 -a "X$1" = 'X-a' ]; then
+	    ARCHS="$2"
+	    shift 2
+    elif [ $# -ge 2 -a "X$1" = 'X-b' ]; then
+	    BUILD="$2"
+	    shift 2
+    elif [ $# -ge 1 -a "X$1" = 'X-c' ]; then
+	    ONLY_CREATE_CHANGELOG=true
+	    shift 1
+    elif [ $# -ge 2 -a "X$1" = 'X-d' ]; then
+	    DATABASE="$2"
+	    shift 2
+    elif [ $# -ge 1 -a "X$1" = 'X-l' ]; then
+            ONLY_CREATE_PKGLIST=true
+            shift 1
+    elif [ $# -ge 2 -a "X$1" = 'X-m' ]; then
+	    LAST_CHANGELOG="$2"
+	    MERGE=true
+	    shift 2
+    elif [ $# -ge 2 -a "X$1" = 'X-o' ]; then
+	    OLDBUILD="$2"
+	    shift 2
+    elif [ $# -ge 2 -a "X$1" = 'X-p' ]; then
+	    PRODUCT="$2"
+	    shift 2
+    elif [ $# -gt 0 -a X$1 = 'X-q' ]; then
+	    VERBOSE=false
+	    shift 1
+    else
+	Usage
+    fi
+done
+
+if [ X"$BUILD" = X ] ; then
+    Usage
+fi
+
+if [ X"$OLDBUILD" = X -a $MERGE = true ] ; then
+    Usage
+fi
+
+if [ X"$OLDBUILD" = X -a $ONLY_CREATE_CHANGELOG = true ] ; then
+    Usage
+fi
+
+if [ X"$OLDBUILD" = X -a $ONLY_CREATE_PKGLIST = true ] ; then
+    Usage
+fi
+
+# Directories
+DATA_RPM="$DATABASE/$PRODUCT/$BUILD/all/RPM"
+DATA_SRPM="$DATABASE/$PRODUCT/$BUILD/all/SRPM"
+
+
+# Files
+DATA_DUPLICATE_RPM="$DATABASE/$PRODUCT/$BUILD/all/DUPLICATE-RPM"
+DATA_DIFFVERSION_RPM="$DATABASE/$PRODUCT/$BUILD/all/DIFFVERSION-RPM"
+DATA_DUPLICATE_SRPM="$DATABASE/$PRODUCT/$BUILD/all/DUPLICATE-SRPM"
+DATA_DIFFARCH_RPM="$DATABASE/$PRODUCT/$BUILD/all/DIFFARCH-RPM"
+
+
+if [ "$ONLY_CREATE_PKGLIST" = true ]; then
+    Compare_pkglist
+fi
+if [ "$ONLY_CREATE_CHANGELOG" = true ]; then
+    GenerateChangeLog
+fi
+if [ "$ONLY_CREATE_CHANGELOG" != true -a "$ONLY_CREATE_PKGLIST" != true ]; then
+    Generate_Data_Structure
+    Check_package_consistency
+    if [ X"$OLDBUILD" != X ]; then
+       Compare_pkglist
+       GenerateChangeLog
+    fi
+fi
+
+Verbose
+Verbose "Done. Result can be found in $DATABASE/$PRODUCT/$BUILD/all"
+Verbose
+
+exit 0

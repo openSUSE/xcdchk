@@ -1,0 +1,1458 @@
+#!/bin/bash
+#
+# Checks if all Source RPMs are on a product and generates
+# a changelog of current snapshot.
+#
+
+#
+# Some variables
+#
+PRODUCT="SLES-10-SP4"
+DATABASE="/data/xcdchk"
+CHECK_ABI=true
+GEN_SATSOLVER_PKG=false
+CHECK_INITRD=false
+CHECK_BOOTDIR=false
+CHECK_MEDIA_METADATA=false
+NEW_SNAPSHOT=""
+DISTDIR="/mounts/dist/install/SLP"
+IS_ADDON=false
+CHECK_RPM_SIG=false
+
+# Dependencies (libsolv-tools and rpmdevtools)
+KUKUKDIR="$(dirname "$(readlink -f "$0")")"
+ELFABI_CMD=$KUKUKDIR/elfabi.pl
+INCDIR=$KUKUKDIR/xcdchk.inc
+SATSOLVER_CMD=/usr/bin/installcheck
+if [ -f /data/sle/bin/rpmvercmp ]; then
+  RPMVERCMP_CMD=/data/sle/bin/rpmvercmp
+else
+  RPMVERCMP_CMD=/usr/bin/rpmdev-vercmp
+fi
+
+
+ARCH=i386
+BUILD=""
+OLDBUILD=""
+VERBOSE=true
+MERGE=false
+ONLY_CREATE_CHANGELOG=false
+ONLY_CREATE_PKGLIST=false
+LAST_CHANGELOG=""
+SATSOLVER_PKG=""
+
+ADDON_PRODUCT=""
+ADDON_BUILD=""
+
+# Directories
+# set later after option evaluation
+DATA_RPM=""
+DATA_SRPM=""
+DATA_NEEDED_SRPM=""
+DATA_PROVIDES=""
+DATA_REQUIRES=""
+DATA_OBSOLETES=""
+DATA_ABI=""
+DATA_INITRD=""
+DATA_BOOTDIR=""
+DATA_METADIR=""
+DATA_FILELIST=""
+DATA_BINARIES=""
+
+# Files
+DATA_MISSING_SRPM=""
+DATA_UNNEEDED_SRPM=""
+DATA_DUPLICATE_RPM=""
+DATA_DUPLICATE_SRPM=""
+DATA_DIFFVERSION_RPM=""
+DATA_SATSOLVER=""
+DATA_MISSING_METADATA=""
+
+# RPM command
+RPM_CMD="rpm --nodigest --nosignature -qp"
+
+# This is needed to consistently sort the entries.
+export LC_COLLATE=de_DE
+
+# Source some files
+. $INCDIR/Compare_pkglist.inc
+
+Usage()
+{
+        fmt -s << EOF
+
+xcdchk - Check snapshot and Generate nice ChangeLog file
+
+Usage:
+
+  xcdchk -b <BUILD> [<OPTIONS>]
+
+Options:
+
+  -a <ARCH>             Generate arch-specific info [default: $ARCH]
+  -abi                  Compare exported symbols of/and shared libraries (def.)
+  -noabi		Do not compare exported symbols/shared librarys
+  -B <PRODUCT> <BUILD>  Use PRODUCT/BUILD as Baseproduct for this Add-On.
+  -b <BUILD>            Build number/name of snapshot
+  -c                    Only create ChangeLogs with existing database
+  -d <DATABASE>         Base directory for data
+                        [default: $DATABASE]
+  -i                    Store and compare content of initrd
+  -l                    Only create package list between two builds
+  -m <LAST_CHANGELOG>   Merge with last changelog file
+  -n <NEW_SNAPSHOT>     Directory of new snapshot
+                        [default: $DISTDIR/$PRODUCT-<BUILD>/$ARCH]
+  -M                    Verify Metadata
+  -o <OLDBUILD>         Build number/name of old snapshot
+  -p <PRODUCT>          Name of product [default $PRODUCT]
+  -r                    Verify RPM integry
+  -S                    Run satsolver on this product
+  -s <packages.gz>      Run satsolver with this additional packages file
+  -q                    Quiet mode
+
+Output goes to $DATABASE/$PRODUCT/<BUILD>/$ARCH
+
+
+Example:
+
+The database needs to be initialised with the first build:
+
+   xcdchk -b <BUILD> [-n <NEW_SNAPSHOT>] [-a <ARCH>] [-d <DATABASE>] \
+          [-p <PRODUCT>]
+
+For the second build xcdchk can now compare the content of the build:
+
+   xcdchk -b <BUILD> -o <OLDBUILD> [-n <NEW_SNAPSHOT>] [-a <ARCH>] \
+          [-d <DATABASE>][-p <PRODUCT>] [-m <LAST_CHANGELOG>]
+
+EOF
+        exit 1
+}
+
+
+Error()
+{
+        echo
+        echo "$@" 1>&2
+        echo
+}
+
+
+Abort()
+{
+        Error "$@"
+        echo
+        echo "Aborting ..."
+        echo
+        exit 1
+}
+
+Verbose()
+{
+    if [ "$VERBOSE" = "true" ]; then
+	if [ $# -gt 0 -a "X$1" = "X-n" ]; then
+	    echo -n "$@" 1>&2
+	else
+	    echo "$@" 1>&2
+	fi
+    fi
+}
+
+Run_Satsolver()
+{
+
+  if [ X"$SATSOLVER_PKG" != X ]; then
+
+     Verbose "Run Sat-Solver tool"
+     Verbose "($SATSOLVER_PKG)"
+
+     if [ $1 == i386 ]; then
+        SATARCH=i586
+     elif [ $1 == ppc ]; then
+        SATARCH=ppc64
+     else
+        SATARCH=$1
+     fi
+     $SATSOLVER_CMD $SATARCH $SATSOLVER_PKG > $DATA_SATSOLVER
+     test -s $DATA_SATSOLVER || rm -f $DATA_SATSOLVER
+  fi
+}
+
+Find_Source_RPMS()
+{
+        if [ $# -eq 1 ]; then
+                if [ -d $1 ]; then
+                        find $1/ -name \*src.rpm -type f
+                fi
+        fi
+}
+
+
+Find_Binary_RPMS()
+{
+        if [ $# -eq 1 ]; then
+                if [ -d $1 ]; then
+                        find $1/ -name boot -prune -false -o \
+				-name \*.rpm -type f | \
+                                grep -v '.src.rpm' | \
+                                grep -v '.patch.rpm'
+                fi
+        fi
+}
+
+Get_RPM_Source_RPM()
+{
+    $RPM_CMD --queryformat '%{SOURCERPM}' $1
+}
+
+Check_RPM_Sig()
+{
+    rpm --checksig $1 > /dev/null
+    local CMPRES=$?
+    if [ $CMPRES -eq 1 ] ; then
+      echo "$2" >> "$DATABASE/$PRODUCT/$BUILD/$ARCH/$BUILD-BROKEN-RPMs"
+    fi
+}
+
+Generate_Data_Structure()
+{
+
+    Verbose "Generate Data Structure below $DATABASE/$PRODUCT/$BUILD/$ARCH"
+
+    #rm -rf $DATABASE/$PRODUCT/$BUILD/$ARCH
+    mkdir -p $DATA_RPM
+    mkdir -p $DATA_SRPM
+    mkdir -p $DATA_NEEDED_SRPM
+    mkdir -p $DATA_PROVIDES
+    mkdir -p $DATA_REQUIRES
+    mkdir -p $DATA_OBSOLETES
+    mkdir -p $DATA_FILELIST
+    test $CHECK_ABI = true && mkdir -p $DATA_ABI
+    test $CHECK_INITRD = true && mkdir -p $DATA_INITRD
+    test $CHECK_BOOTDIR = true && mkdir -p $DATA_BOOTDIR
+}
+
+Generate_Bootdir_Index()
+{
+    local dir="$1"
+
+    if [ -d $dir/DVD1 ] ; then
+      dir="$dir/DVD1"
+    elif [ -d $dir/CD1 ] ; then
+      dir="$dir/CD1"
+    fi
+
+    case $ARCH in
+      ppc|ppc64)
+        sdir="$dir/boot $dir/ppc $dir/suseboot"
+
+        ;;
+      *)
+        sdir="$dir/boot"
+        ;;
+    esac
+
+    Verbose "Collect Bootdirectory Data from $sdir"
+
+    find $sdir | sed -e "s|$dir/||g" |sort > $DATA_BOOTDIR/content
+}
+
+Generate_Initrd_Index()
+{
+    local dir="$1"
+    local KERNEL="default"
+
+    if [ -d $dir/DVD1 ] ; then
+      dir="$dir/DVD1"
+    elif [ -d $dir/CD1 ] ; then
+      dir="$dir/CD1"
+    fi
+
+    case $ARCH in
+      i?86)
+        dir="$dir/boot/i386/loader/initrd"
+        ;;
+      x86_64)
+        dir="$dir/boot/x86_64/loader/initrd"
+        ;;
+      ppc64)
+        dir="$dir/suseboot/initrd64"
+        KERNEL=ppc64
+        ;;
+      *)
+        dir="$dir/boot/$ARCH/initrd"
+        ;;
+    esac
+
+    Verbose "Collect Initrd Data from $dir"
+
+    xzcat $dir | cpio -t | sed -e "s|lib/modules/.*-$KERNEL|lib/modules/\<kernel-version\>-$KERNEL|g" -e "s|lib/firmware/.*-$KERNEL|lib/firmware/\<kernel-version\>-$KERNEL|g" -e "s|/ld-.*.so$|/ld-<glibc-version>.so|g" -e "s|/libc-.*.so$|/libc-<glibc-version>.so|g" -e "s|/libcrypt-.*.so$|/libcrypt-<glibc-version>.so|g" -e "s|/libdl-.*.so$|/libdl-<glibc-version>.so|g" -e "s|/libm-.*.so$|/libm-<glibc-version>.so|g" -e "s|/libnsl-.*.so$|/libnsl-<glibc-version>.so|g" -e "s|/libnss_compat-.*.so$|/libnss_compat-<glibc-version>.so|g" -e "s|/libnss_dns-.*.so$|/libnss_dns-<glibc-version>.so|g" -e "s|/libnss_files-.*.so$|/libnss_files-<glibc-version>.so|g" -e "s|/libnss_hesiod-.*.so$|/libnss_hesiod-<glibc-version>.so|g" -e "s|/libpthread-.*.so$|/libpthread-<glibc-version>.so|g" -e "s|/libresolv-.*.so$|/libresolv-<glibc-version>.so|g" -e "s|/librt-.*.so$|/librt-<glibc-version>.so|g" -e "s|/libutil-.*.so$|/libutil-<glibc-version>.so|g" -e "s|/libhd.so.*|/libhd.so.<libhd-version>|g" -e "s|/libhd_tiny.so.*|/libhd_tiny.so.<libhd-version>|g" | sort -u > $DATA_INITRD/content
+}
+
+Generate_Package_Index()
+{
+    local i
+    local dir="$1"
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.pkgindex.$$"
+
+    rm -rf $WORKDIR
+    mkdir -p $WORKDIR
+
+    Verbose "Collect Data from $dir"
+
+    if [ $CHECK_RPM_SIG = true ]; then
+      Verbose -n "Getting Binary RPM Data and check RPM Integrity "
+    else
+      Verbose -n "Getting Binary RPM Data "
+    fi
+    for i in `Find_Binary_RPMS $dir` ; do
+	Verbose -n "."
+	local RPM_NAME=${i##*/}
+	local RPM_NAME=${RPM_NAME%.rpm}
+	touch $DATA_RPM/$RPM_NAME
+
+	local RPM_ARCH=${RPM_NAME##*.}
+	local PKGNAME=${RPM_NAME%-*-*.*}.$RPM_ARCH
+        local DEPVER=${RPM_NAME%.*}
+	local DEPNAME=${DEPVER%-*-*}
+	DEPVER=${DEPVER##$DEPNAME-}
+
+	if [ $CHECK_RPM_SIG = true ]; then
+	  Check_RPM_Sig $i $PKGNAME
+        fi
+
+	$RPM_CMD --requires $i | grep -v "^rpmlib" | sort -u > $DATA_REQUIRES/$PKGNAME
+	$RPM_CMD --provides $i | grep -v "^$DEPNAME = $DEPVER" | sort -u > $DATA_PROVIDES/$PKGNAME
+	$RPM_CMD --obsoletes $i | grep -v "(none)" | sort -u > $DATA_OBSOLETES/$PKGNAME
+	$RPM_CMD -l $i |sort -u > $DATA_FILELIST/$PKGNAME
+
+	if [ $CHECK_ABI = true -a -s $DATA_PROVIDES/$PKGNAME ]; then
+	    mkdir $WORKDIR/unpacked
+	    (cd $WORKDIR/unpacked; /work/src/bin/unrpm $i > /dev/null 2>&1)
+	    for j in $WORKDIR/unpacked/lib{,64}/lib*.so* $WORKDIR/unpacked/usr/lib{,64}/lib*.so* $WORKDIR/unpacked/opt/gnome/lib{,64}/lib*.so* $WORKDIR/unpacked/opt/kde3/lib{,64}/lib*.so* ; do
+		test -f $j || continue
+		if [ ! -L $j ]; then
+		    local SONAME=`readelf -d $j 2> /dev/null | grep "Library soname" | sed -e "s|.*\[||" -e "s|\].*||"`
+		    test x"$SONAME" = x && continue
+                    local CLASS=`readelf -h $j 2> /dev/null  | grep Class:  | sed -e "s|.*ELF|ELF|"`
+                    local MACHINE=`readelf -h $j 2> /dev/null | grep Machine:`
+                    case "$MACHINE" in
+                      *Intel?80386*)
+                        MACHINE=I386
+                        ;;
+                      *Advanced?Micro?Devices?X86-64*)
+                        MACHINE=X86-64
+                        ;;
+                      *PowerPC)
+                        MACHINE=PowerPC
+                        ;;
+                      *PowerPC64)
+                        MACHINE=PowerPC64
+                        ;;
+                      *IBM?S/390*)
+                        MACHINE=S390
+                        ;;
+		      *Intel?IA-64*)
+			MACHINE=IA64
+			;;
+                    esac
+		    $ELFABI_CMD $j > $DATA_ABI/$SONAME-$MACHINE.$CLASS.$RPM_ARCH
+		fi
+	    done
+	    rm -rf $WORKDIR/unpacked
+	fi
+
+	local SRPM_NAME="`Get_RPM_Source_RPM $i`"
+	SRPM_NAME=${SRPM_NAME%.*.rpm}
+	echo $RPM_NAME >> $DATA_NEEDED_SRPM/$SRPM_NAME
+    done
+    Verbose
+
+    Verbose -n "Getting Source RPM ChangeLogs "
+    for i in `Find_Source_RPMS $dir` ; do
+	Verbose -n "."
+	local SRPM_NAME=${i##*/}
+	SRPM_NAME=${SRPM_NAME%.*.rpm}
+	$RPM_CMD --changelog $i > $DATA_SRPM/$SRPM_NAME
+    done
+    Verbose
+
+    rm -rf $WORKDIR
+}
+
+
+Generate_Binary_List()
+{
+    Verbose -n "Create list of binaries "
+
+    rm -rf $DATA_BINARIES
+    mkdir -p $DATA_BINARIES
+
+    for j in $DATA_FILELIST/* ; do
+	local PKGNAME=${j##*/}
+
+	    for i in `egrep -h '^/(bin|usr/bin|sbin|usr/sbin|opt/kde3/bin|opt/gnome/bin|usr/X11R6/bin)/' $DATA_FILELIST/$PKGNAME | sed -e 's|^/usr/bin/||g' -e 's|^/bin/||g' -e 's|^/usr/sbin/||g' -e 's|^/sbin/||g' -e 's|^/opt/kde3/bin/||g' -e 's|^/opt/gnome/bin/||g' -e 's|^/usr/X11R6/bin/||g' | grep -v '\/'` ; do
+		echo $PKGNAME >> $DATA_BINARIES/$i;
+	    done
+    done
+    Verbose
+}
+
+Find_duplicate_binary_RPMS()
+{
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.duplicate.$$"
+
+    rm -rf $WORKDIR
+    mkdir -p $WORKDIR/packages
+    mkdir -p $WORKDIR/duplicates
+
+    for i in $DATA_RPM/* ; do
+        local RPM_NAME=${i##*/}
+	local RPM_ARCH=${RPM_NAME##*.}
+	local PKGNAME=${RPM_NAME%-*-*.*}.$RPM_ARCH
+
+	if [ -f $WORKDIR/packages/$PKGNAME ]; then
+	    echo "$RPM_NAME" >> $WORKDIR/packages/$PKGNAME
+	    touch $WORKDIR/duplicates/$PKGNAME
+	else
+	    echo "$RPM_NAME" > $WORKDIR/packages/$PKGNAME
+	fi
+    done
+
+    for i in `/bin/ls $WORKDIR/duplicates/` ; do
+	local j
+	local first
+	local pkgwithoutarch=${i%.*}
+
+        first=1
+
+	echo -n "$i:" >> $DATA_DUPLICATE_RPM
+	for j in `cat $WORKDIR/packages/$i` ; do
+            if [ $first -eq 1 ] ; then
+		first=0
+	    else
+		echo -n "," >> $DATA_DUPLICATE_RPM
+	    fi
+	    local ver=${j#$pkgwithoutarch-}; ver=${ver%.*}
+	    echo -n " $ver" >> $DATA_DUPLICATE_RPM
+	done
+	echo >> $DATA_DUPLICATE_RPM
+    done
+
+    rm -rf $WORKDIR
+}
+
+#
+# Search for SRPMs which have different version numbers and delete
+# older versions.
+#
+Find_duplicate_SRPMS()
+{
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.duplicate.$$"
+
+    rm -rf $WORKDIR
+    mkdir -p $WORKDIR/packages
+    mkdir -p $WORKDIR/duplicates
+
+    for i in $DATA_SRPM/* ; do
+        local RPM_NAME=${i##*/}
+	local PKGNAME=${RPM_NAME%-*-*}
+
+	if [ -f $WORKDIR/packages/$PKGNAME ]; then
+	    echo "$RPM_NAME" >> $WORKDIR/packages/$PKGNAME
+	    touch $WORKDIR/duplicates/$PKGNAME
+	else
+	    echo "$RPM_NAME" > $WORKDIR/packages/$PKGNAME
+	fi
+    done
+
+    for i in `/bin/ls $WORKDIR/duplicates/` ; do
+	local j
+	local first
+        local lastver
+
+        first=1
+
+	echo -n "$i:" >> $DATA_DUPLICATE_SRPM
+	for j in `cat $WORKDIR/packages/$i` ; do
+	    lastver=$j
+            if [ $first -eq 1 ] ; then
+		first=0
+		rm $DATA_SRPM/$j
+	    else
+		echo -n "," >> $DATA_DUPLICATE_SRPM
+	    fi
+	    local ver=${j#$i-}
+	    echo -n " $ver" >> $DATA_DUPLICATE_SRPM
+	done
+	echo >> $DATA_DUPLICATE_SRPM
+	touch $DATA_SRPM/$lastver
+    done
+
+    rm -rf $WORKDIR
+}
+
+
+#
+# Ueberprueft, das ein Paket fuer verschiedene Archs die gleiche
+# Versionsnummer hat.
+#
+Check_version_consistency_of_RPMS()
+{
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.WrongArchVersion.$$"
+
+    Verbose "   - Different versions on different archs"
+
+    mkdir -p $WORKDIR/packages
+    mkdir -p $WORKDIR/packages-version
+    mkdir -p $WORKDIR/mismatch
+
+    for i in $DATA_RPM/* ; do
+        local RPM_NAME=${i##*/}
+	local RPM_ARCH=${RPM_NAME##*.}
+	local PKGNAME=${RPM_NAME%-*-*.*}
+	local T=${RPM_NAME%.*}
+	local VERSION=${T#$PKGNAME-}
+
+	if [ -f $WORKDIR/packages/$PKGNAME ]; then
+
+            echo "$RPM_NAME" >> $WORKDIR/packages/$PKGNAME
+
+	    if [ ! -f $WORKDIR/packages-version/$PKGNAME-$VERSION ]; then
+		touch $WORKDIR/mismatch/$PKGNAME
+	    fi
+	else
+	    echo "$RPM_NAME" > $WORKDIR/packages/$PKGNAME
+	    touch $WORKDIR/packages-version/$PKGNAME-$VERSION
+	fi
+    done
+
+    for i in `/bin/ls $WORKDIR/mismatch/` ; do
+	local j
+	local first
+	local pkgwithoutarch=${i%.*}
+
+        first=1
+
+	echo -n "$i:" >> $DATA_DIFFVERSION_RPM
+	for j in `cat $WORKDIR/packages/$i` ; do
+            if [ $first -eq 1 ] ; then
+		first=0
+	    else
+		echo -n "," >> $DATA_DIFFVERSION_RPM
+	    fi
+	    local RPM_ARCH=${j##*.}
+	    local ver=${j#$pkgwithoutarch-}; ver=${ver%.*}
+	    echo -n " $ver.$RPM_ARCH" >> $DATA_DIFFVERSION_RPM
+	done
+	echo >> $DATA_DIFFVERSION_RPM
+    done
+
+    rm -rf $WORKDIR
+}
+
+
+Compare_Provides()
+{
+    local OLD_PROVIDES="$DATABASE/$PRODUCT/$OLDBUILD/$ARCH/PROVIDES"
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.PROVIDES.$$"
+
+
+    Verbose "Compare Provides"
+
+    rm -rf $WORKDIR
+    mkdir -p $WORKDIR
+    mkdir -p $WORKDIR/new
+    mkdir -p $WORKDIR/missing
+
+    local DATA_NEW_PROVIDES="$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-new-Provides"
+    local DATA_MISSING_PROVIDES="$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-missing-Provides"
+    rm -f "$DATA_NEW_PROVIDES"
+    rm -f "$DATA_MISSING_PROVIDES"
+
+    for i in $DATA_PROVIDES/* ; do
+        local RPM_NAME=${i##*/}
+	local RPM_ARCH=${RPM_NAME##*.}
+	local PKGNAME=${RPM_NAME%.*}
+
+	if [ -f $OLD_PROVIDES/$RPM_NAME ]; then
+	   diff -u $OLD_PROVIDES/$RPM_NAME $i |grep -v -- ^--- |grep -v ^+++ > $WORKDIR/diff
+           grep ^- $WORKDIR/diff | sed -e 's|^-||g' > $WORKDIR/missing/$RPM_NAME
+           grep ^+ $WORKDIR/diff | sed -e 's|^+||g' > $WORKDIR/new/$RPM_NAME
+	fi
+    done
+
+    for i in $WORKDIR/missing/* ; do
+	if [ -s $i ]; then
+	   echo ${i##*/}: >> $DATA_MISSING_PROVIDES
+	   cat $i >> $DATA_MISSING_PROVIDES
+	   echo >> $DATA_MISSING_PROVIDES
+	fi
+    done
+
+    for i in $WORKDIR/new/* ; do
+	if [ -s $i ]; then
+	   echo ${i##*/}: >> $DATA_NEW_PROVIDES
+	   cat $i >> $DATA_NEW_PROVIDES
+	   echo >> $DATA_NEW_PROVIDES
+	fi
+    done
+
+    rm -rf $WORKDIR
+}
+
+Compare_Obsoletes()
+{
+    local OLD_OBSOLETES="$DATABASE/$PRODUCT/$OLDBUILD/$ARCH/OBSOLETES"
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.OBSOLETES.$$"
+
+
+    Verbose "Compare Obsoletes"
+
+    rm -rf $WORKDIR
+    mkdir -p $WORKDIR
+    mkdir -p $WORKDIR/new
+    mkdir -p $WORKDIR/missing
+
+    local DATA_NEW_OBSOLETES="$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-new-Obsoletes"
+    local DATA_MISSING_OBSOLETES="$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-missing-Obsoletes"
+    rm -f "$DATA_NEW_OBSOLETES"
+    rm -f "$DATA_MISSING_OBSOLETES"
+
+    for i in $DATA_OBSOLETES/* ; do
+        local RPM_NAME=${i##*/}
+	local RPM_ARCH=${RPM_NAME##*.}
+	local PKGNAME=${RPM_NAME%.*}
+
+	if [ -f $OLD_OBSOLETES/$RPM_NAME ]; then
+	   diff -u $OLD_OBSOLETES/$RPM_NAME $i |grep -v -- ^--- |grep -v ^+++ > $WORKDIR/diff
+           grep ^- $WORKDIR/diff | sed -e 's|^-||g' > $WORKDIR/missing/$RPM_NAME
+           grep ^+ $WORKDIR/diff | sed -e 's|^+||g' > $WORKDIR/new/$RPM_NAME
+	fi
+    done
+
+    for i in $WORKDIR/missing/* ; do
+	if [ -s $i ]; then
+	   echo ${i##*/}: >> $DATA_MISSING_OBSOLETES
+	   cat $i >> $DATA_MISSING_OBSOLETES
+	   echo >> $DATA_MISSING_OBSOLETES
+	fi
+    done
+
+    for i in $WORKDIR/new/* ; do
+	if [ -s $i ]; then
+	   echo ${i##*/}: >> $DATA_NEW_OBSOLETES
+	   cat $i >> $DATA_NEW_OBSOLETES
+	   echo >> $DATA_NEW_OBSOLETES
+	fi
+    done
+
+    rm -rf $WORKDIR
+}
+
+Compare_Binaries()
+{
+    local OLD_BINARIES="$DATABASE/$PRODUCT/$OLDBUILD/$ARCH/BINARIES"
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.BINARIES.$$"
+
+
+    Verbose "Compare Binaries"
+
+    rm -rf $WORKDIR
+    mkdir -p $WORKDIR
+    mkdir -p $WORKDIR/new
+    mkdir -p $WORKDIR/missing
+
+    local DATA_NEW_BINARIES="$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-new-Binaries"
+    local DATA_MISSING_BINARIES="$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-missing-Binaries"
+    rm -f "$DATA_NEW_BINARIES"
+    rm -f "$DATA_MISSING_BINARIES"
+
+
+    cp -p $OLD_BINARIES/* $WORKDIR/missing
+    cp -p $DATA_BINARIES/* $WORKDIR/new
+
+    for i in $DATA_BINARIES/* ; do
+        local BIN_NAME=${i##*/}
+
+	if [ -f $OLD_BINARIES/$BIN_NAME ]; then
+           rm $WORKDIR/missing/$BIN_NAME $WORKDIR/new/$BIN_NAME
+	fi
+    done
+
+    for i in $WORKDIR/missing/* ; do
+	if [ -s $i ]; then
+	   echo ${i##*/}: >> $DATA_MISSING_BINARIES
+	   cat $i >> $DATA_MISSING_BINARIES
+	   echo >> $DATA_MISSING_BINARIES
+	fi
+    done
+
+    for i in $WORKDIR/new/* ; do
+	if [ -s $i ]; then
+	   echo ${i##*/}: >> $DATA_NEW_BINARIES
+	   cat $i >> $DATA_NEW_BINARIES
+	   echo >> $DATA_NEW_BINARIES
+	fi
+    done
+
+    rm -rf $WORKDIR
+}
+
+
+Compare_ABI_Symbols()
+{
+    local OLD_ABI="$DATABASE/$PRODUCT/$OLDBUILD/$ARCH/SHARED-LIBRARIES"
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.ABI.$$"
+
+    Verbose "Compare ABI changes between $OLDBUILD and $BUILD"
+
+    if [ ! -d $OLD_ABI ]; then
+      echo "ERROR: $OLD_ABI is missing!"
+      exit 1;
+    fi
+    if [ ! -d $DATA_ABI ]; then
+      echo "ERROR: $DATA_ABI is missing!"
+      exit 1;
+    fi
+
+    rm -rf $WORKDIR
+    mkdir -p $WORKDIR
+
+    for i in $DATA_ABI/* ; do
+        local NAME=${i##*/}
+
+	echo -n "."
+
+	if [ -f $OLD_ABI/$NAME ]; then
+	    diff -u $OLD_ABI/$NAME $i | tail -n +3 | grep ^- | sed "s|^-||g" > $WORKDIR/$NAME
+	fi
+    done
+
+    echo ""
+
+    DATA_MISSING_ABI="$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-missing-Symbols"
+    rm -f $DATA_MISSING_ABI
+
+    for i in $WORKDIR/* ; do
+	if [ -s $i ]; then
+	   echo ${i##*/}: >> $DATA_MISSING_ABI
+	   cat $i >> $DATA_MISSING_ABI
+	   echo >> $DATA_MISSING_ABI
+	fi
+    done
+
+    rm -rf $WORKDIR
+}
+
+Check_package_consistency()
+{
+    local i
+
+    Verbose "Check package consistency"
+
+
+    Verbose "   - Missing Source RPMs"
+
+    for i in $DATA_NEEDED_SRPM/* ; do
+	i=${i##*/}
+	test -f $DATA_SRPM/$i || echo $i >> $DATA_MISSING_SRPM
+    done
+
+    if [ -f $DATA_MISSING_SRPM ]; then
+	sort -u $DATA_MISSING_SRPM > $DATA_MISSING_SRPM.$$
+	mv $DATA_MISSING_SRPM.$$ $DATA_MISSING_SRPM
+    fi
+
+
+    Verbose "   - Unneeded Source RPMs"
+
+    for i in $DATA_SRPM/* ; do
+	if [ $i == "$DATA_SRPM/*" ]; then
+	  break
+        fi
+        local SRPM_NAME=${i##*/}
+	if [ ! -f $DATA_NEEDED_SRPM/$SRPM_NAME ]; then
+	    echo $SRPM_NAME >> $DATA_UNNEEDED_SRPM
+	    rm $i
+	fi
+    done
+
+    if [ -f $DATA_UNNEEDED_SRPM ]; then
+	sort -u $DATA_UNNEEDED_SRPM > $DATA_UNNEEDED_SRPM.$$
+	mv $DATA_UNNEEDED_SRPM.$$ $DATA_UNNEEDED_SRPM
+    fi
+
+
+    Verbose "   - Different versions of same package"
+
+    Find_duplicate_binary_RPMS
+    Check_version_consistency_of_RPMS
+    Find_duplicate_SRPMS
+}
+
+Compare_Bootdir_Content()
+{
+    local OLD_CONTENT="$DATABASE/$PRODUCT/$OLDBUILD/$ARCH/BOOTDIR/content"
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.bootdir.list.$$"
+
+    mkdir -p $WORKDIR
+
+    rm -f "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-BOOTDIR-new"
+    rm -f "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-BOOTDIR-missing"
+
+    Verbose "Compare Boot Directory Content"
+
+    diff -u $OLD_CONTENT $DATA_BOOTDIR/content |grep -v -- ^--- |grep -v ^+++ > $WORKDIR/diff
+
+    grep ^- $WORKDIR/diff | sed -e 's|^-||g' > $WORKDIR/missing
+    grep ^+ $WORKDIR/diff | sed -e 's|^+||g' > $WORKDIR/new
+
+    test -s $WORKDIR/missing && mv $WORKDIR/missing "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-BOOTDIR-missing"
+    test -s $WORKDIR/new && mv $WORKDIR/new "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-BOOTDIR-new"
+
+    rm -rf $WORKDIR
+}
+
+Compare_Initrd_Content()
+{
+    local OLD_CONTENT="$DATABASE/$PRODUCT/$OLDBUILD/$ARCH/INITRD/content"
+    local WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.initrdlist.$$"
+
+    mkdir -p $WORKDIR
+
+    rm -f "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-INITRD-new"
+    rm -f "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-INITRD-missing"
+
+    Verbose "Compare Initrd Content"
+
+    diff -u $OLD_CONTENT $DATA_INITRD/content |grep -v -- ^--- |grep -v ^+++ > $WORKDIR/diff
+
+    grep ^- $WORKDIR/diff | sed -e 's|^-||g' > $WORKDIR/missing
+    grep ^+ $WORKDIR/diff | sed -e 's|^+||g' > $WORKDIR/new
+
+    test -s $WORKDIR/missing && mv $WORKDIR/missing "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-INITRD-missing"
+    test -s $WORKDIR/new && mv $WORKDIR/new "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-INITRD-new"
+
+    rm -rf $WORKDIR
+}
+
+
+
+Compare_dsolist()
+{
+    local found
+
+    OLD_DSO="$DATABASE/$PRODUCT/$OLDBUILD/$ARCH/SHARED-LIBRARIES"
+    WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.dsolist.$$"
+
+    if [ ! -d $DATA_ABI ]; then
+      echo "ERROR: $DATA_ABI is missing!"
+      exit 1;
+    fi
+
+    if [ ! -d $OLD_ABI ]; then
+      echo "ERROR: $OLD_ABI is missing!"
+      exit 1;
+    fi
+
+    mkdir -p $WORKDIR
+
+    Verbose "Compare DSO changes between $OLDBUILD and $BUILD"
+
+    rm -f "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-unchanged-DSOs"
+    rm -f "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-updated-DSOs"
+    rm -f "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-new-DSOs"
+    rm -f "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-missing-DSOs"
+
+    for i in $DATA_ABI/* ; do
+        local DSO_NAME=${i##*/}
+
+	echo -n "."
+
+	if [ -f $OLD_DSO/$DSO_NAME ]; then
+	    echo $DSO_NAME >> "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-unchanged-DSOs"
+	    touch "$WORKDIR"/"$DSO_NAME"
+	else
+	    local j
+	    local DSO_ARCH=${DSO_NAME##*-}
+	    local DSONAME=${DSO_NAME%.so.*-*}
+	    local LIST=`/bin/ls "$OLD_DSO"/"$DSONAME".so.*-* 2>/dev/null`
+	    local found
+
+	    found=0
+
+	    if [ X"$LIST" != X ]; then
+		for j in $LIST ; do
+		    local T2=${j##*/}
+		    local T_ARCH=${T2##*-}
+		    local T=${T2%.so.*-*}
+		    if [ "$DSONAME.$DSO_ARCH" = "$T.$T_ARCH" ]; then
+			echo "$T2 => $DSO_NAME" >> "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-updated-DSOs"
+			touch $WORKDIR/$T2
+			found=1
+			break
+		    fi
+		done
+	    fi
+
+	    if [ $found -eq 0 ]; then
+		echo $DSO_NAME >> "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-new-DSOs"
+	    fi
+	fi
+    done
+
+    echo ""
+
+    for i in $OLD_DSO/* ; do
+        local DSO_NAME=${i##*/}
+	if [ ! -f $WORKDIR/$DSO_NAME ]; then
+	    echo $DSO_NAME >> "$DATABASE/$PRODUCT/$BUILD/$ARCH/$OLDBUILD-$BUILD-missing-DSOs"
+	fi
+    done
+
+    rm -rf $WORKDIR
+}
+
+
+Check_Media_Metadata()
+{
+    local dir="$1"
+    local media=0
+    local lastone=0
+
+    rm -f $DATA_MISSING_METADATA
+
+    while [ $lastone -eq 0 ] ; do
+
+      media=$(($media+1))
+
+      if [ -d $dir/DVD$media ] ; then
+        sdir="$dir/DVD$media"
+      elif [ -d $dir/CD$media ] ; then
+        sdir="$dir/CD$media"
+      elif [ $media -ne 1 ] ; then
+        break
+      else
+        sdir=$dir
+        lastone=1
+      fi
+
+      for i in content media.$media/build media.$media/media media.$media/products ; do
+        test -f $sdir/$i || echo Media$media/$i >> $DATA_MISSING_METADATA
+      done
+
+      if [ $media -eq 1 ] ; then
+	if [ ! -f $sdir/license.tar.gz -a ! -f $sdir/media.1/license.zip ]; then
+	    echo Media1/license.tar.gz >> $DATA_MISSING_METADATA
+	fi
+	if [ ! -f $sdir/suse/setup/descr/packages -a ! -f $sdir/suse/setup/descr/packages.gz ]; then
+	    echo "Media1/suse/setup/descr/packages" >> $DATA_MISSING_METADATA
+	fi
+	NEEDED_FILES="pubring.gpg content.key content.asc directory.yast ChangeLog NEWS README media.$media/products.asc media.$media/products.key media.$media/directory.yast suse/setup/descr/directory.yast suse/setup/descr/patterns"
+	if [ "$IS_ADDON" = false ]; then
+	    NEEDED_FILES="$NEEDED_FILES control.xml"
+	fi
+	for i in $NEEDED_FILES; do
+          test -f $sdir/$i || echo Media$media/$i >> $DATA_MISSING_METADATA
+        done
+      fi
+    done
+}
+
+Check_Addon()
+{
+    BASERPMS="$DATABASE/$ADDON_PRODUCT/$ADDON_BUILD/$ARCH/RPM"
+    WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/tmp.pkglist.$$"
+
+    Verbose "Compare packages between Base product and Addon Product"
+
+    mkdir -p $WORKDIR
+    rm -f "$DATABASE/$PRODUCT/$BUILD/$ARCH/$BUILD-$ADDON_PRODUCT-RPMs"
+
+    for i in $DATA_RPM/* ; do
+        local RPM_NAME=${i##*/}
+
+        if [ -f $BASERPMS/$RPM_NAME ]; then
+            echo $RPM_NAME >> "$DATABASE/$PRODUCT/$BUILD/$ARCH/$BUILD-$ADDON_PRODUCT-RPMs"
+            touch "$WORKDIR"/"$RPM_NAME"
+        else
+            local j
+            local RPM_ARCH=${RPM_NAME##*.}
+            local PKGNAME=${RPM_NAME%-*-*}
+            local LIST=`/bin/ls "$BASERPMS"/"$PKGNAME"-*-* 2>/dev/null`
+            local found
+
+            found=0
+
+            if [ X"$LIST" != X ]; then
+                for j in $LIST ; do
+                    local T2=${j##*/}
+		    local T_ARCH=${T2##*.}
+		    local T=${T2%-*-*}
+                    if [ "$PKGNAME.$RPM_ARCH" = "$T.$T_ARCH" ]; then
+                        local VER1=${RPM_NAME#$PKGNAME-}; VER1=${VER1%.*}
+                        local VER2=${T2#$PKGNAME-}; VER2=${VER2%.*}
+                        $RPMVERCMP_CMD $VER1 $VER2
+                        local CMPRES=$?
+                        if [ $CMPRES -eq 1 ] || [ $CMPRES -eq 11 ] ; then
+			    echo "$RPM_NAME is newer than base product ($T2)" >> "$DATABASE/$PRODUCT/$BUILD/$ARCH/$BUILD-$ADDON_PRODUCT-RPMs"
+			else
+			    echo "$RPM_NAME is older than base product ($T2)" >> "$DATABASE/$PRODUCT/$BUILD/$ARCH/$BUILD-$ADDON_PRODUCT-RPMs"
+			fi
+                        break
+                    fi
+                done
+            fi
+	fi
+    done
+}
+
+
+Format_ChangeLog()
+{
+    if [ ! -f "`dirname $1`/changelog.old" ]; then
+	echo "## WARNING - the following diff is a head -20 proposal"
+	cat $1 | sed -n '/^+/s/^.//p' | \
+	    sed '{
+                                /^++/d
+                                /^$/d
+                                }'
+    else
+	cat $1 | sed -n '/^+/s/^.//p' | \
+	    sed '{
+                                /^++/d
+                                /^*/d
+                                /^$/d
+                                }'
+    fi
+}
+
+
+GenerateChangeLog_by_SRPMchanges_package()
+{
+    local rpmname=${1##*/}
+    local pkgdir=$2/$rpmname
+    local snippetdir=$3
+
+
+    case $rpmname in
+      kernel-source)
+      ;;
+      kernel-*)
+      return
+      ;;
+      yast2-trans-*)
+      return
+      ;;
+      sles-release)
+      return
+      ;;
+      ConsoleKit-doc|dbus-1-x11|dbus-1-mono|hal-doc|installation-images|PolicyKit-doc|unixODBC-gui-qt|blocxx-doc|libgcj|openldap2-client|samba-doc|libqt4-devel-doc|libqt4-sql-plugins|libQtWebKit-devel|systemtap-docs|postgresql-libs)
+      return
+      ;;
+    esac
+
+    if [ ! -f $pkgdir/changelog.new ]; then
+	echo "o Removed $rpmname (XXX)"
+    elif [ ! -f $pkgdir/changelog.old ]; then
+	echo "o Added $rpmname (feature)"
+	touch $pkgdir/changelog.old
+	diff -u $pkgdir/changelog.old \
+	    $pkgdir/changelog.new \
+	    | head -20 \
+	    > $pkgdir/changelog.diff
+	rm -f $pkgdir/changelog.old
+    else
+	diff -u $pkgdir/changelog.old \
+	    $pkgdir/changelog.new \
+	    > $pkgdir/changelog.diff
+	if [ ! -s $pkgdir/changelog.diff ]; then
+	    continue
+	fi
+	if [ -f $snippetdir/$rpmname ]; then
+          head -n 1 $snippetdir/$rpmname
+	else
+	    echo "o Updated $rpmname (security/bugfix/feature)"
+	fi
+    fi
+
+    echo
+    test -f $pkgdir/changelog.diff && Format_ChangeLog $pkgdir/changelog.diff
+}
+
+GenerateChangeLog_by_SRPMchanges()
+{
+    local i
+    OLD_SRPM="$DATABASE/$PRODUCT/$OLDBUILD/$ARCH/SRPM"
+    local WORKDIR="$1/packages"
+
+    mkdir -p $WORKDIR
+
+    Verbose -n "Building Changelog diffs "
+
+    for i in $DATA_SRPM/* ; do
+        local SRPM_NAME=${i##*/}
+	local PKGNAME=${SRPM_NAME%-*-*}
+
+	mkdir -p $WORKDIR/$PKGNAME
+        cp $i $WORKDIR/$PKGNAME/changelog.new
+    done
+
+    for i in $OLD_SRPM/* ; do
+        local SRPM_NAME=${i##*/}
+	local PKGNAME=${SRPM_NAME%-*-*}
+
+	mkdir -p $WORKDIR/$PKGNAME
+        cp $i $WORKDIR/$PKGNAME/changelog.old
+    done
+
+    for i in $WORKDIR/* ; do
+      Verbose -n "."
+      GenerateChangeLog_by_SRPMchanges_package $i $WORKDIR $1/snippets > $i/snippet
+    done
+
+    Verbose
+}
+
+# Split_ChangeLog - splits changelog file into per package snippets
+#
+# Expects the following format:
+#
+#       o {Updated,Added,Removed} <PACKAGENAME> ...
+#
+#         - ...
+#         - ...
+#
+#       --------------------------------------------------------------------
+#
+Split_ChangeLog()
+{
+        local WORKDIR="$1"
+        local TMP_CHANGELOG="$WORKDIR/ChangeLog.tmp.$$"
+	local PKG_LIST="$WORKDIR/PKG_LIST.$$"
+        local changelog_file=""
+        local dest_dir=""
+        local i
+
+	shift 1
+
+        if [ $# -ne 2 ]; then
+                Abort "Split_ChangeLog: Wrong number of arguments"
+        else
+                changelog_file="$1"
+                dest_dir="$2"
+        fi
+
+        # prepare current copy of changelog for parsing
+        rm -f $TMP_CHANGELOG
+        cp $changelog_file $TMP_CHANGELOG
+
+        # determine list of packages contained in changelog
+        rm -f $PKG_LIST
+        sed -n '/^o [^ ]* [^ ]* /s/^o [^ ]* \([^ ]*\) .*$/\1/p' $TMP_CHANGELOG | sort -u > $PKG_LIST
+
+	rm -fr $dest_dir
+        mkdir -p $dest_dir
+        for i in `cat $PKG_LIST` ; do
+                sed -n "/^o [^ ]* $i /,/^-----/p" $TMP_CHANGELOG \
+                        | sed '/^-----/d' >> $dest_dir/$i
+        done
+
+	rm -f $TMP_CHANGELOG
+	rm -f $PKG_LIST
+}
+
+MergeChangeLogSnippets()
+{
+    local WORKDIR="$1"
+    local PKG_LIST="$WORKDIR/PKG_LIST.$$"
+
+    mkdir -p $WORKDIR/merged-snippets
+
+    for i in $WORKDIR/packages/* ; do
+	local pkgname=${i##*/}
+	test -s $WORKDIR/packages/$pkgname/snippet && sed "s/^/#/g" $WORKDIR/packages/$pkgname/snippet > $WORKDIR/merged-snippets/$pkgname
+    done
+
+    for i in $WORKDIR/snippets/* ; do
+	local pkgname=${i##*/}
+        if [ -f $WORKDIR/merged-snippets/$pkgname ]; then
+	    cat $i |sed "/^o /d" |sed "/^$/d" >> $WORKDIR/merged-snippets/$pkgname
+	else
+	    # empty line is already there on the end,
+	    # remove it.
+	    head -n 2 $i > $WORKDIR/merged-snippets/$pkgname
+	    tail -n +2 $i | sed "/^$/d" >> $WORKDIR/merged-snippets/$pkgname
+	fi
+    done
+}
+
+GenerateChangeLog()
+{
+    WORKDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/ChangeLog-tmp.$$"
+
+    mkdir -p $WORKDIR
+
+    if [ "$MERGE" = "true" ]; then
+        # Create split of old changelog and save to snippets
+        Split_ChangeLog $WORKDIR $LAST_CHANGELOG $WORKDIR/snippets
+    fi
+
+    GenerateChangeLog_by_SRPMchanges $WORKDIR
+
+    NEW_CHANGELOG=$DATABASE/$PRODUCT/$BUILD/$ARCH/ChangeLog-$OLDBUILD-$BUILD
+
+    rm -f $NEW_CHANGELOG
+    for i in $WORKDIR/packages/*/snippet; do
+	if [ -s $i ]; then
+	    cat $i >> $NEW_CHANGELOG
+	    echo >> $NEW_CHANGELOG
+	    echo "-----------------------------------------------------------------------------" >> $NEW_CHANGELOG
+	    echo >> $NEW_CHANGELOG
+	fi
+    done
+
+    if [ "$MERGE" = "true" ]; then
+	MergeChangeLogSnippets $WORKDIR
+
+	NEW_CHANGELOG=$DATABASE/$PRODUCT/$BUILD/$ARCH/ChangeLog.raw
+
+	rm -f $NEW_CHANGELOG
+	for i in $WORKDIR/merged-snippets/*; do
+	    cat $i >> $NEW_CHANGELOG
+	    echo >> $NEW_CHANGELOG
+	    echo "-----------------------------------------------------------------------------" >> $NEW_CHANGELOG
+	    echo >> $NEW_CHANGELOG
+	done
+    fi
+
+    rm -rf $WORKDIR
+}
+
+#
+# Main
+#
+
+#
+# Argument parsing
+#
+
+while [ 1 ]; do
+    if [ $# -eq 0 ]; then
+	    break
+    fi
+
+    if [ $# -ge 2 -a "X$1" = 'X-a' ]; then
+	    ARCH="$2"
+	    shift 2
+    elif [ $# -ge 1 -a "X$1" = 'X-abi' ]; then
+	    CHECK_ABI=true
+	    shift 1
+    elif [ $# -ge 1 -a "X$1" = 'X-noabi' ]; then
+	    CHECK_ABI=false
+	    shift 1
+    elif [ $# -ge 2 -a "X$1" = 'X-b' ]; then
+	    BUILD="$2"
+	    shift 2
+    elif [ $# -ge 1 -a "X$1" = 'X-c' ]; then
+	    ONLY_CREATE_CHANGELOG=true
+	    shift 1
+    elif [ $# -ge 2 -a "X$1" = 'X-d' ]; then
+	    DATABASE="$2"
+	    shift 2
+    elif [ $# -ge 1 -a "X$1" = 'X-l' ]; then
+	    ONLY_CREATE_PKGLIST=true
+	    shift 1
+    elif [ $# -ge 2 -a "X$1" = 'X-m' ]; then
+	    LAST_CHANGELOG="$2"
+	    MERGE=true
+	    shift 2
+    elif [ $# -ge 1 -a "X$1" = 'X-M' ]; then
+	    CHECK_MEDIA_METADATA=true
+	    shift 1
+    elif [ $# -ge 2 -a "X$1" = 'X-n' ]; then
+	    NEW_SNAPSHOT="$2"
+	    shift 2
+    elif [ $# -ge 2 -a "X$1" = 'X-o' ]; then
+	    OLDBUILD="$2"
+	    shift 2
+    elif [ $# -ge 2 -a "X$1" = 'X-p' ]; then
+	    PRODUCT="$2"
+	    shift 2
+    elif [ $# -gt 0 -a X$1 = 'X-q' ]; then
+	    VERBOSE=false
+	    shift 1
+    elif [ $# -ge 1 -a "X$1" = 'X-r' ]; then
+            CHECK_RPM_SIG=true
+            shift 1
+    elif [ $# -ge 2 -a X$1 = 'X-s' ]; then
+	    SATSOLVER_PKG="$SATSOLVER_PKG $2"
+	    shift 2
+    elif [ $# -gt 0 -a X$1 = 'X-S' ]; then
+	    GEN_SATSOLVER_PKG=true
+            shift 1
+    elif [ $# -gt 0 -a X$1 = 'X-i' ]; then
+	    CHECK_INITRD=true
+            CHECK_BOOTDIR=true
+            shift 1
+    elif [ $# -ge 3 -a X$1 = 'X-B' ]; then
+	    IS_ADDON=true
+	    ADDON_PRODUCT=$2
+	    ADDON_BUILD=$3
+	    shift 3
+    else
+	Usage
+    fi
+done
+
+if [ X"$BUILD" = X ] ; then
+    Usage
+fi
+
+if [ X"$OLDBUILD" = X -a $MERGE = true ] ; then
+    Usage
+fi
+
+if [ X"$OLDBUILD" = X -a $ONLY_CREATE_CHANGELOG = true ] ; then
+    Usage
+fi
+
+if [ X"$OLDBUILD" = X -a $ONLY_CREATE_PKGLIST = true -a $IS_ADDON = false ] ; then
+    Usage
+fi
+
+if [ X"$NEW_SNAPSHOT" = X ] ; then
+    NEW_SNAPSHOT="$DISTDIR/$PRODUCT-$BUILD/$ARCH"
+fi
+
+# Directories
+DATA_RPM="$DATABASE/$PRODUCT/$BUILD/$ARCH/RPM"
+DATA_SRPM="$DATABASE/$PRODUCT/$BUILD/$ARCH/SRPM"
+DATA_NEEDED_SRPM="$DATABASE/$PRODUCT/$BUILD/$ARCH/NEEDED-SRPM"
+DATA_PROVIDES="$DATABASE/$PRODUCT/$BUILD/$ARCH/PROVIDES"
+DATA_REQUIRES="$DATABASE/$PRODUCT/$BUILD/$ARCH/REQUIRES"
+DATA_OBSOLETES="$DATABASE/$PRODUCT/$BUILD/$ARCH/OBSOLETES"
+DATA_ABI="$DATABASE/$PRODUCT/$BUILD/$ARCH/SHARED-LIBRARIES"
+DATA_INITRD="$DATABASE/$PRODUCT/$BUILD/$ARCH/INITRD"
+DATA_BOOTDIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/BOOTDIR"
+DATA_METADIR="$DATABASE/$PRODUCT/$BUILD/$ARCH/META"
+DATA_FILELIST="$DATABASE/$PRODUCT/$BUILD/$ARCH/FILELISTS"
+DATA_BINARIES="$DATABASE/$PRODUCT/$BUILD/$ARCH/BINARIES"
+
+# Files
+DATA_MISSING_SRPM="$DATABASE/$PRODUCT/$BUILD/$ARCH/MISSING-SRPM"
+DATA_UNNEEDED_SRPM="$DATABASE/$PRODUCT/$BUILD/$ARCH/UNNEEDED-SRPM"
+DATA_DUPLICATE_RPM="$DATABASE/$PRODUCT/$BUILD/$ARCH/DUPLICATE-RPM"
+DATA_DUPLICATE_SRPM="$DATABASE/$PRODUCT/$BUILD/$ARCH/DUPLICATE-SRPM"
+DATA_DIFFVERSION_RPM="$DATABASE/$PRODUCT/$BUILD/$ARCH/DIFFVERSION-RPM"
+DATA_SATSOLVER="$DATABASE/$PRODUCT/$BUILD/$ARCH/SATSOLVER"
+DATA_MISSING_METADATA="$DATABASE/$PRODUCT/$BUILD/$ARCH/$BUILD-missing-Metadata"
+
+
+# Delete old tree and generate new one very early ...
+if [ "$ONLY_CREATE_CHANGELOG" != true -a "$ONLY_CREATE_PKGLIST" != true ]; then
+    Generate_Data_Structure
+fi
+
+# Always backup packages.gz if we found one, maybe we need it later for
+# an add-on product
+mkdir -p $DATA_METADIR
+if [ -d $NEW_SNAPSHOT/DVD1 ] ; then
+  if [ -f $NEW_SNAPSHOT/DVD1/suse/setup/descr/packages.gz ] ; then
+     cp -p $NEW_SNAPSHOT/DVD1/suse/setup/descr/packages.gz $DATA_METADIR
+  else
+     cp -p $NEW_SNAPSHOT/DVD1/suse/setup/descr/packages $DATA_METADIR
+     gzip -f $DATA_METADIR/packages
+  fi
+  SATSOLVER_PKG="$DATA_METADIR/packages.gz $SATSOLVER_PKG"
+elif [ -d $NEW_SNAPSHOT/CD1 ] ; then
+  if [ -f $NEW_SNAPSHOT/CD1/suse/setup/descr/packages.gz ] ; then
+     cp -p $NEW_SNAPSHOT/CD1/suse/setup/descr/packages.gz $DATA_METADIR
+  else
+     cp -p $NEW_SNAPSHOT/CD1/suse/setup/descr/packages $DATA_METADIR
+     gzip -f $DATA_METADIR/packages
+  fi
+  SATSOLVER_PKG="$DATA_METADIR/packages.gz $SATSOLVER_PKG"
+elif [ -d $NEW_SNAPSHOT/suse ] ; then
+  if [ -f $NEW_SNAPSHOT/suse/setup/descr/packages.gz ] ; then
+      cp -p $NEW_SNAPSHOT/suse/setup/descr/packages.gz $DATA_METADIR
+  else
+     cp -p $NEW_SNAPSHOT/suse/setup/descr/packages $DATA_METADIR
+     gzip -f $DATA_METADIR/packages
+  fi
+  SATSOLVER_PKG="$DATA_METADIR/packages.gz $SATSOLVER_PKG"
+fi
+
+if [ "$IS_ADDON" = true ]; then
+   SATSOLVER_PKG="$DATABASE/$ADDON_PRODUCT/$ADDON_BUILD/$ARCH/META/packages.gz $SATSOLVER_PKG"
+fi
+
+if [ "$ONLY_CREATE_CHANGELOG" != true ]; then
+  if [ "$ONLY_CREATE_PKGLIST" != true ]; then
+    Run_Satsolver $ARCH
+  fi
+  if [ $CHECK_MEDIA_METADATA = true ]; then
+     if [ "$ONLY_CREATE_PKGLIST" != true ]; then
+       Check_Media_Metadata $NEW_SNAPSHOT
+     fi
+  fi
+  if [ $CHECK_INITRD = true ]; then
+     if [ "$ONLY_CREATE_PKGLIST" != true ]; then
+       Generate_Initrd_Index $NEW_SNAPSHOT
+     fi
+     if [ X"$OLDBUILD" != X ]; then
+       Compare_Initrd_Content
+     fi
+  fi
+  if [ $CHECK_BOOTDIR = true ]; then
+     if [ "$ONLY_CREATE_PKGLIST" != true ]; then
+       Generate_Bootdir_Index $NEW_SNAPSHOT
+     fi
+     if [ X"$OLDBUILD" != X ]; then
+       Compare_Bootdir_Content
+     fi
+  fi
+  if [ "$ONLY_CREATE_PKGLIST" != true ]; then
+    Generate_Package_Index $NEW_SNAPSHOT
+    Generate_Binary_List
+    Check_package_consistency
+  fi
+  if [ "$IS_ADDON" = true ]; then
+    Check_Addon
+  fi
+  if [ X"$OLDBUILD" != X ]; then
+    Compare_Provides
+    Compare_Obsoletes
+    Compare_Binaries
+    Compare_pkglist
+    if [ "$CHECK_ABI" = true ]; then
+      Compare_ABI_Symbols
+      Compare_dsolist
+    fi
+  fi
+fi
+if [ "$ONLY_CREATE_PKGLIST" != true ]; then
+    GenerateChangeLog
+fi
+
+Verbose
+Verbose "Done. Result can be found in $DATABASE/$PRODUCT/$BUILD/$ARCH"
+Verbose
+if [ -f "$DATA_MISSING_SRPM" -a "$VERBOSE" != "false" -a "$ONLY_GENERATE_CHANGELOG" = "false" ]; then
+    echo ""
+    echo "MISSING Source RPMs:"
+    cat $DATA_MISSING_SRPM
+fi
+if [ -f $DATA_MISSING_METADATA -a $VERBOSE != "false" ]; then
+    echo ""
+    echo "ERROR: Missing Metadata:"
+    cat $DATA_MISSING_METADATA
+fi
+#if [ -f $DATA_UNNEEDED_SRPM -a $VERBOSE != "false" ]; then
+#    echo ""
+#    echo "UNNEEDED Source RPMs:"
+#    cat $DATA_UNNEEDED_SRPM
+#fi
+
+exit 0
