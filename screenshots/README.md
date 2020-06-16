@@ -1,4 +1,4 @@
-== Screenshots of the original application ==
+## Screenshots of the original application
 
 These screenshots are informational only.
 This was the original web interface of xcdchk written in perl.
